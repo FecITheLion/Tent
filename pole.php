@@ -4,12 +4,25 @@ declare(strict_types=1);
 
 final class Root
 {
+    /**
+     * Objects and their associated information.
+     */
     public SplObjectStorage $thread;
 
+    /**
+     * Converts each stored object and its information into the value
+     * passed to the raw-text serializer.
+     */
     public Closure $inform;
 
+    /**
+     * Raw-text serializer.
+     */
     public Closure $deform;
 
+    /**
+     * Secondary protection against unexpectedly deep structures.
+     */
     private int $maximumDepth;
 
     public function __construct(int $maximumDepth = 512)
@@ -24,8 +37,14 @@ final class Root
         $this->thread = new SplObjectStorage();
 
         /*
-         * Converts an attached object and its associated information
-         * into the value supplied to the raw serializer.
+         * Preserve the root object.
+         *
+         * Do not convert it with:
+         *
+         *     array_values(get_object_vars($object))
+         *
+         * The serializer must receive the actual object so root and
+         * nested objects use the same representation.
          */
         $this->inform = static function (
             object $object,
@@ -38,10 +57,8 @@ final class Root
         };
 
         /*
-         * Public raw-text serializer.
-         *
-         * The argument is passed by reference so array references
-         * remain observable during traversal.
+         * The value must be accepted by reference so PHP array
+         * references remain observable during recursive traversal.
          */
         $this->deform = function (mixed &$value): string {
             return $this->deformValue($value);
@@ -75,27 +92,50 @@ final class Root
         return $this;
     }
 
+    public function getMaximumDepth(): int
+    {
+        return $this->maximumDepth;
+    }
+
+    /**
+     * Add an object to the root storage.
+     *
+     * offsetSet() is used instead of deprecated attach().
+     */
     public function attach(
         object $object,
         mixed $information = null
     ): self {
-        $this->thread->attach($object, $information);
+        $this->thread->offsetSet(
+            $object,
+            $information
+        );
 
         return $this;
     }
 
+    /**
+     * Remove an object from the root storage.
+     *
+     * offsetUnset() is used instead of deprecated detach().
+     */
     public function detach(object $object): self
     {
-        if ($this->thread->contains($object)) {
-            $this->thread->detach($object);
+        if ($this->thread->offsetExists($object)) {
+            $this->thread->offsetUnset($object);
         }
 
         return $this;
     }
 
+    /**
+     * Determine whether an object is in the root storage.
+     *
+     * offsetExists() is used instead of deprecated contains().
+     */
     public function contains(object $object): bool
     {
-        return $this->thread->contains($object);
+        return $this->thread->offsetExists($object);
     }
 
     public function count(): int
@@ -103,34 +143,50 @@ final class Root
         return $this->thread->count();
     }
 
+    public function clear(): self
+    {
+        /*
+         * Collect first so the storage isn't mutated while its
+         * iterator is active.
+         */
+        $objects = [];
+
+        foreach ($this->thread as $object) {
+            $objects[] = $object;
+        }
+
+        foreach ($objects as $object) {
+            $this->thread->offsetUnset($object);
+        }
+
+        return $this;
+    }
+
     /**
-     * Serialize a complete value using raw string operations.
+     * Serialize a complete PHP value using only raw text operations.
      *
-     * No json_encode(), serialize(), var_export(), print_r(),
-     * or similar serialization function is used.
+     * No json_encode(), serialize(), var_export(), or print_r()
+     * is used.
      */
     private function deformValue(mixed &$value): string
     {
         /*
-         * Objects currently on the active traversal path.
+         * Objects on the current recursion path.
          */
         $activeObjects = new SplObjectStorage();
 
         /*
-         * Stable output labels for encountered objects.
+         * Stable labels assigned to objects for this serialization.
          */
         $objectLabels = new SplObjectStorage();
 
         /*
-         * Array-reference IDs currently on the active path.
-         *
-         * The key is the binary string returned by
-         * ReflectionReference::getId().
+         * PHP array-reference IDs on the active recursion path.
          */
         $activeArrayReferences = [];
 
         /*
-         * Stable readable labels assigned to array references.
+         * Stable readable labels assigned to PHP array references.
          */
         $arrayReferenceLabels = [];
 
@@ -221,8 +277,8 @@ final class Root
     private function deformFloat(float $value): string
     {
         /*
-         * NaN and infinity are not valid JSON numbers.
-         * They are therefore emitted as quoted text.
+         * NaN and infinity are not valid JSON numbers, so they are
+         * emitted as manually quoted text.
          */
         if (is_nan($value)) {
             return '"NaN"';
@@ -239,7 +295,8 @@ final class Root
         $text = (string) $value;
 
         /*
-         * Preserve the visible distinction between 1 and 1.0.
+         * Preserve the visible difference between an integer-like
+         * float and an actual integer.
          */
         if (
             strpos($text, '.') === false &&
@@ -252,12 +309,11 @@ final class Root
     }
 
     /**
-     * Serialize a PHP array.
+     * Serialize an array and protect against recursive references.
      *
-     * Array identity is not manufactured. Instead, each element is
-     * inspected to determine whether that element is an actual PHP
-     * reference. Only reference edges participate in circular-array
-     * tracking.
+     * Arrays cannot use spl_object_id(). Instead, only elements that
+     * are actual PHP references are identified with
+     * ReflectionReference::getId().
      */
     private function deformArray(
         array &$array,
@@ -274,12 +330,11 @@ final class Root
         $isSequential = $this->isSequentialArray($array);
         $parts = [];
 
+        /*
+         * Iteration by reference is required to preserve nested PHP
+         * reference identity.
+         */
         foreach ($array as $key => &$value) {
-            /*
-             * Returns null for a normal array element and a
-             * ReflectionReference when this element was assigned
-             * through PHP reference semantics.
-             */
             $reference = ReflectionReference::fromArrayElement(
                 $array,
                 $key
@@ -304,8 +359,8 @@ final class Root
                     $arrayReferenceLabels[$referenceId];
 
                 /*
-                 * This exact PHP reference is already being followed
-                 * higher on the active recursion path.
+                 * The same reference edge is already active higher
+                 * on the current traversal path.
                  */
                 if (
                     array_key_exists(
@@ -314,23 +369,22 @@ final class Root
                     )
                 ) {
                     $serializedValue = '{'
-                        . '"$arrayReference":'
+                        . '"$arrayRef":'
                         . $referenceLabel
                         . '}';
 
-                    $parts[] = $isSequential
-                        ? $serializedValue
-                        : '"'
-                            . $this->escapeText((string) $key)
-                            . '":'
-                            . $serializedValue;
+                    $parts[] = $this->formatArrayElement(
+                        $key,
+                        $serializedValue,
+                        $isSequential
+                    );
 
                     continue;
                 }
 
                 /*
-                 * Mark this reference edge as active only while
-                 * traversing the value reached through it.
+                 * Mark this PHP reference as active only for the
+                 * duration of the branch reached through it.
                  */
                 $activeArrayReferences[$referenceId] = true;
 
@@ -346,7 +400,7 @@ final class Root
                 }
             } else {
                 /*
-                 * Ordinary nonreference array element.
+                 * Ordinary non-reference array element.
                  */
                 $serializedValue = $deform(
                     $value,
@@ -354,18 +408,15 @@ final class Root
                 );
             }
 
-            if ($isSequential) {
-                $parts[] = $serializedValue;
-            } else {
-                $parts[] = '"'
-                    . $this->escapeText((string) $key)
-                    . '":'
-                    . $serializedValue;
-            }
+            $parts[] = $this->formatArrayElement(
+                $key,
+                $serializedValue,
+                $isSequential
+            );
         }
 
         /*
-         * Break the foreach reference after iteration.
+         * Break the lingering foreach reference.
          */
         unset($value);
 
@@ -380,9 +431,23 @@ final class Root
             . '}';
     }
 
+    private function formatArrayElement(
+        int|string $key,
+        string $serializedValue,
+        bool $isSequential
+    ): string {
+        if ($isSequential) {
+            return $serializedValue;
+        }
+
+        return '"'
+            . $this->escapeText((string) $key)
+            . '":'
+            . $serializedValue;
+    }
+
     /**
-     * Serialize an object using object identity for recursion
-     * protection.
+     * Serialize an object using native object identity.
      */
     private function deformObject(
         object $object,
@@ -392,15 +457,16 @@ final class Root
         int &$nextObjectLabel,
         int $depth
     ): string {
-        /*
-         * spl_object_id() is the native identity mechanism for
-         * objects. The numeric ID is also included for diagnostic
-         * visibility.
-         */
         $nativeObjectId = spl_object_id($object);
 
-        if (!$objectLabels->contains($object)) {
-            $objectLabels->attach(
+        /*
+         * Assign a stable serializer-local label.
+         *
+         * offsetExists() and offsetSet() replace the deprecated
+         * contains() and attach() methods.
+         */
+        if (!$objectLabels->offsetExists($object)) {
+            $objectLabels->offsetSet(
                 $object,
                 $nextObjectLabel
             );
@@ -408,9 +474,13 @@ final class Root
             ++$nextObjectLabel;
         }
 
-        $objectLabel = $objectLabels[$object];
+        $objectLabel = $objectLabels->offsetGet($object);
 
-        if ($activeObjects->contains($object)) {
+        /*
+         * This exact object is already being serialized higher on
+         * the current recursion path.
+         */
+        if ($activeObjects->offsetExists($object)) {
             return '{'
                 . '"$ref":'
                 . $objectLabel
@@ -420,7 +490,13 @@ final class Root
                 . '}';
         }
 
-        $activeObjects->attach($object);
+        /*
+         * offsetSet() replaces deprecated attach().
+         */
+        $activeObjects->offsetSet(
+            $object,
+            true
+        );
 
         try {
             $parts = [];
@@ -432,13 +508,16 @@ final class Root
                 . $nativeObjectId;
 
             $parts[] = '"$class":"'
-                . $this->escapeText(get_class($object))
+                . $this->escapeText(
+                    get_class($object)
+                )
                 . '"';
 
             /*
-             * Casting exposes stored public, protected, and private
-             * properties. References are retained in the resulting
-             * property array.
+             * Casting exposes initialized stored properties.
+             *
+             * Private and protected property names may contain NUL
+             * delimiters, which normalizePropertyName() handles.
              */
             $properties = (array) $object;
 
@@ -463,19 +542,20 @@ final class Root
                 . '}';
         } finally {
             /*
-             * Active-path tracking allows an object to appear again
-             * in a separate nonrecursive branch.
+             * offsetUnset() replaces deprecated detach().
+             *
+             * Removing the object here makes this active-path
+             * tracking, not global duplicate tracking.
              */
-            $activeObjects->detach($object);
+            $activeObjects->offsetUnset($object);
         }
     }
 
+    /**
+     * PHP 8.0-compatible equivalent of array_is_list().
+     */
     private function isSequentialArray(array $array): bool
     {
-        /*
-         * Manual implementation keeps compatibility with PHP 8.0,
-         * where array_is_list() is unavailable.
-         */
         $expectedKey = 0;
 
         foreach ($array as $key => $unused) {
@@ -489,21 +569,21 @@ final class Root
         return true;
     }
 
+    /**
+     * Normalize PHP's object-to-array property names.
+     *
+     * Protected:
+     *     "\0*\0property"
+     *
+     * Private:
+     *     "\0ClassName\0property"
+     */
     private function normalizePropertyName(string $key): string
     {
         if (strpos($key, "\0") === false) {
             return $key;
         }
 
-        /*
-         * Protected property:
-         *
-         *     "\0*\0property"
-         *
-         * Private property:
-         *
-         *     "\0ClassName\0property"
-         */
         $parts = explode("\0", $key);
         $propertyName = (string) end($parts);
 
@@ -521,9 +601,9 @@ final class Root
     }
 
     /**
-     * Escape raw text manually.
+     * Escape manually constructed quoted text.
      *
-     * No JSON encoder is involved.
+     * No JSON encoder is used.
      */
     private function escapeText(string $text): string
     {
@@ -564,6 +644,9 @@ final class Root
                     break;
 
                 default:
+                    /*
+                     * Escape C0 control bytes manually.
+                     */
                     if ($ordinal < 32) {
                         $result .= sprintf(
                             '\\u%04x',
@@ -621,6 +704,9 @@ final class Root
 
         $data = stream_get_contents($stream);
 
+        /*
+         * Restore the original stream position when possible.
+         */
         if ($position !== false && $rewound) {
             fseek($stream, $position);
         }
@@ -633,6 +719,10 @@ final class Root
                 . '}';
         }
 
+        /*
+         * Binary-to-text conversion only. This does not use a JSON
+         * encoder or general PHP serializer.
+         */
         $encodedData = base64_encode($data);
 
         return '{'
@@ -645,9 +735,10 @@ final class Root
     }
 
     /**
-     * Produce one complete top-level JSON-compatible array.
+     * Return one complete top-level JSON-compatible array.
      *
-     * The text is manually constructed by the deform closure.
+     * Root objects are preserved and sent through deformObject(),
+     * exactly like nested objects.
      */
     public function __toString(): string
     {
@@ -660,6 +751,10 @@ final class Root
                 $element = $this->thread->current();
                 $information = $this->thread->getInfo();
 
+                /*
+                 * $element remains an object. It is not flattened
+                 * with get_object_vars() or array_values().
+                 */
                 $informed = ($this->inform)(
                     $element,
                     $information
@@ -672,6 +767,9 @@ final class Root
 
             return ($this->deform)($output);
         } catch (Throwable $throwable) {
+            /*
+             * __toString() must always return a string.
+             */
             return '{'
                 . '"error":{'
                 . '"type":"'
@@ -693,26 +791,30 @@ final class Root
 
 /*
  * ============================================================
- * Recursive object test
+ * Tests
  * ============================================================
  */
 
-$first = new stdClass();
-$second = new stdClass();
+/*
+ * Recursive objects:
+ *
+ * Alpha -> Beta -> Alpha
+ */
+$alpha = new stdClass();
+$beta = new stdClass();
 
-$first->name = 'Alpha';
-$second->name = 'Beta';
+$alpha->name = 'Alpha';
+$beta->name = 'Beta';
 
-$first->child = $second;
-$second->parent = $first;
+$alpha->child = $beta;
+$beta->parent = $alpha;
 
 
 /*
- * ============================================================
- * Direct recursive associative-array test
- * ============================================================
+ * Recursive associative array:
+ *
+ * metadata.self -> metadata
  */
-
 $metadata = [
     'enabled' => true,
     'count' => 10
@@ -722,11 +824,10 @@ $metadata['self'] =& $metadata;
 
 
 /*
- * ============================================================
- * Direct recursive sequential-array test
- * ============================================================
+ * Recursive sequential array:
+ *
+ * list[2] -> list
  */
-
 $list = [
     'one',
     'two'
@@ -736,13 +837,11 @@ $list[] =& $list;
 
 
 /*
- * ============================================================
- * Indirect recursive-array test
+ * Indirect recursive arrays:
  *
- * left -> right -> left
- * ============================================================
+ * left.right -> right
+ * right.left -> left
  */
-
 $left = [
     'name' => 'left'
 ];
@@ -756,28 +855,26 @@ $right['left'] =& $left;
 
 
 /*
- * Add the recursive arrays to the recursive object.
+ * Attach recursive arrays to the object graph.
  */
-
-$first->metadata =& $metadata;
-$first->list =& $list;
-$first->left =& $left;
+$alpha->metadata =& $metadata;
+$alpha->list =& $list;
+$alpha->left =& $left;
 
 
 /*
- * ============================================================
- * Serialize
- * ============================================================
+ * Store and output.
  */
-
 $root = new Root(512);
 
 $root->attach(
-    $first,
+    $alpha,
     [
         'position' => 1,
         'active' => true
     ]
 );
+
+header('Content-Type: application/json; charset=UTF-8');
 
 echo $root;
