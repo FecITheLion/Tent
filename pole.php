@@ -56,6 +56,7 @@ class Root
 
     public function __toString()
     {
+        $strung = "";
         $inform = fn($ion, $info) => $info;
         $this->thread->rewind();
         while($this->thread->valid()) {
@@ -65,11 +66,10 @@ class Root
             $info = $this->thread->getInfo();
             $information = ($this->inform)($element, $info);
             $identity = ($this->deform)($information);
-
-            var_dump($identity);
-            var_dump($element);
+            $strung .= $identity;
             $this->thread->next();
         }
+        return $strung;
         throw new \Exception('Not implemented');
     }
 }
